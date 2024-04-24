@@ -4,11 +4,12 @@
 
   Commands:
   REF reference_frequency_in_Hz reference_divider reference_multiplier(UNDIVIDED/DOUBLE/HALF) - Set reference frequency, reference divider and reference doubler/divide by 2
-  (FREQ/FREQ_P) frequency_in_Hz power_level(0-4) aux_power_level(0-4) aux_frequency_output(DIVIDED/FUNDAMENTAL) frequency_tolerance_in_Hz calculation_timeout_in_mS - set RF frequency (FREQ_P sets precision mode), power level, auxiliary output frequency mode, frequency tolerance (precision mode only), calculation timeout (precision mode only - 0 to disable)
+  F frequency_in_Hz power_level(0-4) attenuation (0-15)
+  FD frequency_delta_Hz [power_level(0-4) attenuation (0-15)]
   FREQ_DIRECT R_divider INT_value MOD_value FRAC_value RF_DIVIDER_value PRESCALER_value FRACTIONAL_MODE(true/false) - sets RF parameters directly
   (BURST/BURST_CONT/BURST_SINGLE) on_time_in_uS off time_in_uS count (AUX) - perform a on/off burst on frequency and power level set with FREQ/FREQ_P - count is only used with BURST_CONT - if AUX is used, will burst on the auxiliary output; otherwise, it will burst on the primary output
-  SWEEP start_frequency stop_frequency step_in_mS(1-32767) power_level(1-4) aux_power_level(0-4) aux_frequency_output(DIVIDED/FUNDAMENTAL) - sweep RF frequency
-  STEP frequency_in_Hz - set channel step
+  SWEEP start_frequency stop_frequency step_in_mS(1-32767) [power_level(1-4) [aux_power_level(0-4) aux_frequency_output(DIVIDED/FUNDAMENTAL)]] - sweep RF frequency
+  STEP frequency_in_Hz [step_in_mS(1-32767)] - set sweep step and time per sample
   STATUS - view status of VFO
   CE (ON/OFF) - enable/disable MAX2870
   CP_CURRENT current_in_mA_floating - adjust charge pump current to suit your loop filter (default library value is 2.56 mA)
@@ -16,23 +17,30 @@
 
 */
 
-#include <MAX2870.h>
-#include <BigNumber.h> // obtain at https://github.com/nickgammon/BigNumber
+#include "MAX2870.h"
+
+//#define EXTERNAL_ATTENUATOR // define only if HMC540 0-15 dB attenuator is fitted
 
 MAX2870 vfo;
 
-// use hardware SPI pins for Data and Clock
-const byte SSpin = 10; // LE
-const byte LockPin = 12; // MISO
-const byte CEpin = 9;
-
-const word SweepSteps = 14; // SweepSteps * ((4 * 6) + (2 * 3)) is the temporary memory calculation (remember to leave enough for BigNumber) - 14 is the limit which will not cause an ATmega328 based board to hang during a frequency sweep
+// use hardware SPI pins for Data and Clock (+MUXOUT?)
+const byte SSpin = 48; // LE
+const byte LockPin = 50; // MISO no
+const byte CEpin = 52;
+#ifdef EXTERNAL_ATTENUATOR
+const byte Att0 = 40; // ext att HMC540 DO 40-43 0000 max attenuation 15 dB
+#endif
 
 const int CommandSize = 50;
 char Command[CommandSize];
+#ifdef EXTERNAL_ATTENUATOR
+int8_t ExtAtt;
+#endif
+uint32_t sweep_fStep = 1000000L;  // default 1 MHz
+uint16_t sweep_tStep = 100;       // default 100 ms
 
 // ensures that the serial port is flushed fully on request
-const unsigned long SerialPortRate = 9600;
+const unsigned long SerialPortRate = 115200;
 const byte SerialPortRateTolerance = 5; // percent - increase to 50 for rates above 115200 up to 4000000
 const byte SerialPortBits = 10; // start (1), data (8), stop (1)
 const unsigned long TimePerByte = ((((1000000ULL * SerialPortBits) / SerialPortRate) * (100 + SerialPortRateTolerance)) / 100); // calculated on serial port rate + tolerance and rounded down to the nearest uS, long caters for even the slowest serial port of 75 bps
@@ -66,21 +74,24 @@ void FlushSerialBuffer() {
   }
 }
 
-void getField (char* buffer, int index) {
+bool getField (char* buffer, int index) {
   int CommandPos = 0;
   int FieldPos = 0;
   int SpaceCount = 0;
+  bool found = false;
   while (CommandPos < CommandSize) {
-    if (Command[CommandPos] == 0x20) {
+    if (Command[CommandPos] == ' ') {
       SpaceCount++;
       CommandPos++;
     }
-    if (Command[CommandPos] == 0x0D || Command[CommandPos] == 0x0A) {
+    char c = Command[CommandPos];
+    if (!c || c == 0x0D || c == 0x0A) {
       break;
     }
     if (SpaceCount == index) {
-      buffer[FieldPos] = Command[CommandPos];
+      buffer[FieldPos] = c;
       FieldPos++;
+      found = true;
     }
     CommandPos++;
   }
@@ -88,43 +99,84 @@ void getField (char* buffer, int index) {
     buffer[ch] = toupper(buffer[ch]);
   }
   buffer[FieldPos] = '\0';
+  return found;
+}
+
+char* lltoa( long long value, char *string, int radix)
+{
+  char tmp[33];
+  char *tp = tmp;
+  long i;
+  int sign;
+  char *sp;
+
+  if ( string == NULL )
+  {
+    return 0 ;
+  }
+
+  if (radix > 36 || radix <= 1)
+  {
+    return 0 ;
+  }
+
+  sign = (radix == 10 && value < 0);
+  if (sign)
+  {
+    value = -value;
+  }
+
+  while (value || tp == tmp)
+  {
+    i = value % radix;
+    value /= radix;
+    if (i < 10)
+      *tp++ = i+'0';
+    else
+      *tp++ = i + 'a' - 10;
+  }
+
+  sp = string;
+
+  if (sign)
+    *sp++ = '-';
+  while (tp > tmp)
+    *sp++ = *--tp;
+  *sp = 0;
+
+  return string;
 }
 
 void PrintVFOstatus() {
-  Serial.print(F("R: "));
-  Serial.println(vfo.ReadR());
   if (vfo.ReadRDIV2() != 0 && vfo.ReadRefDoubler() != 0) {
     Serial.println(F("Reference doubler and reference divide by 2 enabled - invalid state"));
   }
   else if (vfo.ReadRDIV2() != 0) {
-    Serial.println(F("Reference divide by 2"));
+    Serial.print(F("REF/2"));
   }
   else if (vfo.ReadRefDoubler() != 0) {
-    Serial.println(F("Reference doubler enabled"));
+    Serial.print(F("REF*2"));
   }
   else {
-    Serial.println(F("Reference doubler and divide by 2 disabled"));
+    Serial.print(F("REF_NO*/"));
   }
-  Serial.print(F("Int: "));
-  Serial.println(vfo.ReadInt());
-  Serial.print(F("Fraction: "));
-  Serial.println(vfo.ReadFraction());
-  Serial.print(F("Mod: "));
-  Serial.println(vfo.ReadMod());
-  Serial.print(F("Output divider: "));
-  Serial.println(vfo.ReadOutDivider());
-  Serial.print(F("Output divider power of 2: "));
-  Serial.println(vfo.ReadOutDivider_PowerOf2());
-  Serial.print(F("PFD frequency (Hz): "));
-  Serial.println(vfo.ReadPFDfreq());
-  Serial.print(F("Frequency step (Hz): "));
-  Serial.println(vfo.MAX2870_ChanStep);
-  Serial.print(F("Frequency error (Hz): "));
-  Serial.println(vfo.MAX2870_FrequencyError);
-  Serial.print(F("Current frequency (Hz): "));
+  Serial.print(F("  R:")); Serial.print(vfo.ReadR());
+  Serial.print(F("  INT:")); Serial.print(vfo.ReadInt());
+  Serial.print(F("  FRAC/MOD:")); Serial.print(vfo.ReadFraction());
+  Serial.print(F("/")); Serial.print(vfo.ReadMod());
+  Serial.print(F("  OutDIV:")); Serial.print(vfo.ReadOutDivider());
+  Serial.print(F(" (2^")); Serial.print(vfo.ReadOutDivider_PowerOf2()); Serial.println(F(")"));
+  Serial.print(F("fPFD_Hz:")); Serial.print(vfo.ReadPFDfreq());
+  Serial.print(F("  PWR A:")); Serial.print(vfo.ReadPowerLevel());
+  Serial.print(F(" B:")); Serial.print(vfo.ReadAuxPowerLevel());
+#ifdef EXTERNAL_ATTENUATOR
+  Serial.print(F(" ExtAtt:")); Serial.println(ExtAtt);
+#endif
   char CurrentFreq[MAX2870_ReadCurrentFrequency_ArraySize];
-  vfo.ReadCurrentFrequency(CurrentFreq);
-  Serial.println(CurrentFreq);
+  Serial.print(F("fOUT_Hz:")); Serial.print(lltoa(vfo.ReadCurrentFrequency(),CurrentFreq,10));
+  Serial.print(F("  fERR_Hz:")); Serial.print(vfo.MAX2870_FrequencyError);
+  Serial.print(F("  fStep_Hz:")); Serial.println(sweep_fStep);
+  Serial.print(F("  tStep_ms:")); Serial.println(sweep_tStep);
 }
 
 void PrintErrorCode(byte value) {
@@ -170,9 +222,9 @@ void PrintErrorCode(byte value) {
     case MAX2870_ERROR_PRECISION_FREQUENCY_CALCULATION_TIMEOUT:
       Serial.println(F("Precision frequency calculation timeout"));
       break;
-    case MAX2870_WARNING_FREQUENCY_ERROR:
-      Serial.println(F("Actual frequency is different than desired"));
-      break;
+//    case MAX2870_WARNING_FREQUENCY_ERROR:
+//      Serial.println(F("Actual frequency is different than desired"));
+//      break;
     case MAX2870_ERROR_DOUBLER_EXCEEDED:
       Serial.println(F("Reference frequency with doubler exceeded"));
       break;
@@ -198,6 +250,23 @@ void setup() {
   Serial.begin(SerialPortRate);
   vfo.init(SSpin, LockPin, true, CEpin, true);
   digitalWrite(CEpin, HIGH); // enable the MAX2870
+
+  // initial setting @@@@@@ TEST RV
+  delay(100);
+  vfo.setrf(100000000UL, 5, MAX2870_REF_HALF);
+  vfo.setCPcurrent(5.12);
+  vfo.setf(3000000000LL, 1); // 3 GHz
+
+#ifdef EXTERNAL_ATTENUATOR
+  // external attenuator
+  for (int i=0; i<4; i++)
+  {
+    pinMode(Att0+i, OUTPUT);
+    // set max att
+    digitalWrite(Att0+i, LOW);
+  }
+  ExtAtt = 15;
+#endif
 }
 
 void loop() {
@@ -209,6 +278,14 @@ void loop() {
       ByteCount++;
     }
     else {
+      if (ByteCount < CommandSize)
+        Command[ByteCount] = 0;
+      else
+        Command[CommandSize-1] = 0;
+      Serial.println();
+      Serial.print("RECEIVED: '");
+      Serial.print(Command);
+      Serial.println("'");
       ByteCount = 0;
       bool ValidField = true;
       char field[20];
@@ -232,13 +309,19 @@ void loop() {
           PrintErrorCode(ErrorCode);
         }
       }
-      else if (strcmp(field, "FREQ") == 0 || strcmp(field, "FREQ_P") == 0) {
-        bool PrecisionRequired = false;
-        if (strcmp(field, "FREQ_P") == 0) {
-          PrecisionRequired = true;
+      else if (strcmp(field, "F") == 0 || strcmp(field, "FD") == 0) {
+        bool FreqDeltaRequired = false;
+        if (strcmp(field, "FD") == 0) {
+          FreqDeltaRequired = true;
         }
-        getField(field, 2);
-        byte PowerLevel = atoi(field);
+        
+        byte PowerLevel;
+        if (getField(field, 2))
+          PowerLevel = atoi(field);
+        else
+          PowerLevel = vfo.ReadPowerLevel();
+      
+        /*
         getField(field, 3);
         byte AuxPowerLevel = atoi(field);
         getField(field, 4);
@@ -260,14 +343,40 @@ void loop() {
         getField(field, 6);
         unsigned long CalculationTimeout = atol(field);
         unsigned long FrequencyWriteTimeStart = millis();
+        */
         if (ValidField == true) {
           getField(field, 1);
-          byte ErrorCode = vfo.setf(field, PowerLevel, AuxPowerLevel, AuxFrequencyDivider, PrecisionRequired, FrequencyTolerance, CalculationTimeout);
-          if (ErrorCode != MAX2870_ERROR_NONE && ErrorCode != MAX2870_WARNING_FREQUENCY_ERROR) {
+          long long freq = atoll(field);
+          if (FreqDeltaRequired)
+            freq += vfo.ReadCurrentFrequency();
+
+          byte ErrorCode = vfo.setf(freq, PowerLevel); //, AuxPowerLevel, AuxFrequencyDivider, PrecisionRequired, FrequencyTolerance, CalculationTimeout);
+          if (ErrorCode != MAX2870_ERROR_NONE)
             ValidField = false;
+#ifdef EXTERNAL_ATTENUATOR
+          else
+          {
+            // set external attenuator
+            if (getField(field, 3))
+            {
+              int8_t tempExtAtt = atoi(field);
+              if (tempExtAtt >= 0 && tempExtAtt < 16)
+              {
+                ExtAtt = tempExtAtt;
+                for (int i=0; i<4; i++)
+                {
+                  digitalWrite(Att0+i, !(tempExtAtt & 1));
+                  tempExtAtt >>= 1;
+                }
+              }
+              else
+                Serial.println("BAD EXT ATT");
+            }
           }
+#endif
           PrintErrorCode(ErrorCode);
           if (ValidField == true) {
+            /*
             unsigned long FrequencyWriteTime = millis();
             FrequencyWriteTime -= FrequencyWriteTimeStart;
             Serial.print(F("Time measured during setf() with CPU speed of "));
@@ -279,6 +388,7 @@ void loop() {
             Serial.print(F("."));
             Serial.print((FrequencyWriteTime % 1000));
             Serial.println(F(" seconds"));
+            */
             PrintVFOstatus();
           }
         }
@@ -396,145 +506,61 @@ void loop() {
           }
         }
       }
+      
       else if (strcmp(field, "SWEEP") == 0) {
-        BigNumber::begin(12); // will finish on setf()
         getField(field, 1);
-        BigNumber BN_StartFrequency(field);
+        long long StartFrequency = atoll(field);
         getField(field, 2);
-        BigNumber BN_StopFrequency(field);
-        getField(field, 3);
-        word SweepStepTime = atoi(field);
-        getField(field, 4);
-        byte PowerLevel = atoi(field);
-        getField(field, 5);
-        byte AuxPowerLevel = atoi(field);
-        getField(field, 6);
-        byte AuxFrequencyDivider;
-        if (strcmp(field, "DIVIDED") == 0) {
-          AuxFrequencyDivider = MAX2870_AUX_DIVIDED;
+        long long StopFrequency = atoll(field);
+        byte PowerLevel, AuxPowerLevel = 0, AuxFrequencyDivider = MAX2870_AUX_DIVIDED;
+        if (getField(field, 3)) {
+          PowerLevel = atoi(field);
+
+          if (getField(field, 4))
+            AuxPowerLevel = atoi(field);
+          if (getField(field, 5) && !strcmp(field, "FUNDAMENTAL"))
+            AuxFrequencyDivider = MAX2870_AUX_FUNDAMENTAL;
         }
-        else if (strcmp(field, "FUNDAMENTAL") == 0) {
-          AuxFrequencyDivider = MAX2870_AUX_FUNDAMENTAL;
-        }
-        else {
-          ValidField = false;
-        }
-        if (ValidField == true) {
-          if (BN_StartFrequency < BN_StopFrequency) {
-            char tmpstr[12];
-            ultoa(vfo.MAX2870_ChanStep, tmpstr, 10);
-            char tmpstr2[12];
-            ultoa(SweepSteps, tmpstr2, 10);
-            BigNumber BN_StepSize = ((BN_StopFrequency - BN_StartFrequency) / (BigNumber(tmpstr2)) - BigNumber("1"));
-            if (BN_StepSize >= BigNumber(tmpstr)) {
-              BigNumber BN_StepSizeRounding = (BN_StepSize / BigNumber(tmpstr));
-              uint32_t StepSizeRounding = (uint32_t)((uint32_t) BN_StepSizeRounding);
-              ultoa(StepSizeRounding, tmpstr2, 10);
-              BN_StepSize = (BigNumber(tmpstr) * BigNumber(tmpstr2));
-              char StepSize[14];
-              char StartFrequency[14];
-              char* tempstring1 = BN_StepSize.toString();
-              for (int i = 0; i < 14; i++) {
-                byte temp = tempstring1[i];
-                if (temp == '.') {
-                  StepSize[i] = 0x00;
-                  break;
-                }
-                StepSize[i] = temp;
-              }
-              free(tempstring1);
-              char* tempstring2 = BN_StartFrequency.toString();
-              BigNumber::finish();
-              for (int i = 0; i < 14; i++) {
-                byte temp = tempstring2[i];
-                if (temp == '.') {
-                  StepSize[i] = 0x00;
-                  break;
-                }
-                StartFrequency[i] = temp;
-              }
-              free(tempstring2);
-              uint32_t regs[(MAX2870_RegsToWrite * SweepSteps)];
-              uint32_t reg_temp[MAX2870_RegsToWrite];
-              for (word SweepCount = 0; SweepCount < SweepSteps; SweepCount++) {
-                Serial.print(F("Calculating step "));
-                Serial.print(SweepCount);
-                char CurrentFrequency[14];
-                BigNumber::begin(12);
-                BigNumber BN_CurrentFrequency = (BigNumber(StartFrequency) + (BigNumber(StepSize) * BigNumber(SweepCount)));
-                char* tempstring3 = BN_CurrentFrequency.toString();
-                BigNumber::finish();
-                for (int y = 0; y < 14; y++) {
-                  byte temp = tempstring3[y];
-                  if (temp == '.') {
-                    CurrentFrequency[y] = 0x00;
-                    break;
-                  }
-                  CurrentFrequency[y] = temp;
-                }
-                free(tempstring3);
-                Serial.print(F(" - frequency is now "));
-                Serial.print(CurrentFrequency);
-                Serial.println(F(" Hz"));
-                byte ErrorCode = vfo.setf(CurrentFrequency, PowerLevel, AuxPowerLevel, AuxFrequencyDivider, false, 0, 0);
-                if (ErrorCode != MAX2870_ERROR_NONE) {
-                  ValidField = false;
-                  PrintErrorCode(ErrorCode);
-                  break;
-                }
-                PrintVFOstatus();
-                vfo.ReadSweepValues(reg_temp);
-                for (int y = 0; y < MAX2870_RegsToWrite; y++) {
-                  regs[(y + (MAX2870_RegsToWrite * SweepCount))] = reg_temp[y];
-                }
-              }
-              if (ValidField == true) {
-                Serial.println(F("Now sweeping"));
-                FlushSerialBuffer();
-                while (true) {
-                  if (Serial.available() > 0) {
-                    break;
-                  }
-                  for (word SweepCount = 0; SweepCount < SweepSteps; SweepCount++) {
-                    if (Serial.available() > 0) {
-                      break;
-                    }
-                    for (int y = 0; y < MAX2870_RegsToWrite; y++) {
-                      reg_temp[y] = regs[(y + (MAX2870_RegsToWrite * SweepCount))];
-                    }
-                    vfo.WriteSweepValues(reg_temp);
-                    delay(SweepStepTime);
-                  }
-                  Serial.print(F("*"));
-                }
-                Serial.print(F(""));
-                Serial.println(F("End of sweep"));
-              }
-            }
-            else {
-              BigNumber::finish();
-              Serial.println(F("Calculated frequency step is smaller than preset frequency step"));
-              ValidField = false;
-            }
-          }
-          else {
-            BigNumber::finish();
+        else
+          PowerLevel = vfo.ReadPowerLevel(); // default: no change current value
+
+        if (StartFrequency >= StopFrequency || sweep_fStep == 0 || sweep_tStep == 0) {
+          if (sweep_fStep == 0 || sweep_tStep == 0)
+            Serial.println(F("Please use command STEP before SWEEP"));
+          else
             Serial.println(F("Stop frequency must be greater than start frequency"));
-            ValidField = false;
-          }
         }
         else {
-          BigNumber::finish();
+          Serial.println(F("Now sweeping"));
+          FlushSerialBuffer();
+          while (true) {
+            if (Serial.available() > 0) {
+              break;
+            }
+            long long f = StartFrequency;
+            if (vfo.setf(f, PowerLevel, AuxPowerLevel, AuxFrequencyDivider) != MAX2870_ERROR_NONE) {
+              Serial.println(F("Bad initial frequency"));
+              break;
+            }
+            for (; f <= StopFrequency; f += sweep_fStep) {
+              if (Serial.available() > 0) {
+                break;
+              }
+              delay(sweep_tStep);
+              vfo.sweepStep(f);
+            }
+            Serial.print(F("*"));
+          }
+          Serial.println();
+          Serial.println(F("End of sweep"));
         }
       }
+      
       else if (strcmp(field, "STEP") == 0) {
         getField(field, 1);
-        unsigned long StepFrequency = atol(field);
-        byte ErrorCode = vfo.SetStepFreq(StepFrequency);
-        if (ErrorCode != MAX2870_ERROR_NONE) {
-          ValidField = false;
-          PrintErrorCode(ErrorCode);
-        }
+        sweep_fStep = atol(field);
+        if (getField(field, 2))
+          sweep_tStep = atol(field);
       }
       else if (strcmp(field, "STATUS") == 0) {
         PrintVFOstatus();

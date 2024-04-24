@@ -36,35 +36,39 @@
 
    @section dependencies Dependencies
 
-   This library uses the BigNumber library from Nick Gammon
-   Requires the BitFieldManipulation library: http://github.com/brycecherry75/BitFieldManipulation
-   Requires the BeyondByte library: http://github.com/brycecherry75/BeyondByte
-
    @section author Author
 
    Bryce Cherry
+   2024apr07 modified by Roberto Visentin to use "long long" and Farey algorithm
 
 */
 
 #include "MAX2870.h"
 
-MAX2870::MAX2870()
+MAX2870::MAX2870(uint32_t SPIclock)
 {
-  SPISettings MAX2870_SPI(10000000UL, MSBFIRST, SPI_MODE0);
+  SPISettings MAX2870_SPI(SPIclock, MSBFIRST, SPI_MODE0); // RV changed from 10 MHz to 500 kHz due to filtered
+  MAX2870_currentF = 0;
 }
 
 void MAX2870::WriteRegs()
 {
+  SPI.beginTransaction(MAX2870_SPI);
+  SPI.setClockDivider(255); // 329 kHz not working with SPISettings... (?)
   for (int i = 5 ; i >= 0 ; i--) { // sequence according to the MAX2870 datasheet
-    SPI.beginTransaction(MAX2870_SPI);
+    uint8_t *pReg = (uint8_t *)(MAX2870_R+i);
     digitalWrite(MAX2870_PIN_SS, LOW);
     delayMicroseconds(1);
-    BeyondByte.writeDword(0, MAX2870_R[i], 4, BeyondByte_SPI, MSBFIRST);
+    //BeyondByte.writeDword(0, MAX2870_R[i], 4, BeyondByte_SPI, MSBFIRST);
+    SPI.transfer(pReg[3]);  // transfer one DWORD from MSB
+    SPI.transfer(pReg[2]);
+    SPI.transfer(pReg[1]);
+    SPI.transfer(pReg[0]);
     delayMicroseconds(1);
     digitalWrite(MAX2870_PIN_SS, HIGH);
-    SPI.endTransaction();
     delayMicroseconds(1);
   }
+  SPI.endTransaction();
 }
 
 void MAX2870::WriteSweepValues(const uint32_t *regs) {
@@ -81,39 +85,39 @@ void MAX2870::ReadSweepValues(uint32_t *regs) {
 }
 
 uint16_t MAX2870::ReadR() {
-  return BitFieldManipulation.ReadBF_dword(14, 10, MAX2870_R[0x02]);
+  return uint16_t(MAX2870_R[2] >> 14) & 1023;
 }
 
 uint16_t MAX2870::ReadInt() {
-  return BitFieldManipulation.ReadBF_dword(15, 16, MAX2870_R[0x00]);
+  return uint16_t(MAX2870_R[0] >> 15);
 }
 
 uint16_t MAX2870::ReadFraction() {
-  return BitFieldManipulation.ReadBF_dword(3, 12, MAX2870_R[0x00]);
+  return uint16_t(MAX2870_R[0] >> 3) & 4095;
 }
 
 uint16_t MAX2870::ReadMod() {
-  return BitFieldManipulation.ReadBF_dword(3, 12, MAX2870_R[0x01]);
+  return uint16_t(MAX2870_R[1] >> 3) & 4095;
 }
 
 uint8_t MAX2870::ReadOutDivider() {
-  return (1 << BitFieldManipulation.ReadBF_dword(20, 3, MAX2870_R[0x04]));
+  return 1 << ReadOutDivider_PowerOf2();
 }
 
 uint8_t MAX2870::ReadOutDivider_PowerOf2() {
-  return BitFieldManipulation.ReadBF_dword(20, 3, MAX2870_R[0x04]);
+  return uint8_t(MAX2870_R[4] >> 20) & 7;
 }
 
 uint8_t MAX2870::ReadRDIV2() {
-  return BitFieldManipulation.ReadBF_dword(24, 1, MAX2870_R[0x02]);
+  return (MAX2870_R[2] & 0x1000000L) ? 1:0;
 }
 
 uint8_t MAX2870::ReadRefDoubler() {
-  return BitFieldManipulation.ReadBF_dword(25, 1, MAX2870_R[0x02]);
+  return (MAX2870_R[2] & 0x2000000L) ? 1:0;
 }
 
-double MAX2870::ReadPFDfreq() {
-  double value = MAX2870_reffreq;
+uint32_t MAX2870::ReadPFDfreq() {
+  uint32_t value = MAX2870_reffreq;
   uint16_t temp = ReadR();
   if (temp == 0) { // avoid division by zero
     return 0;
@@ -132,46 +136,94 @@ int32_t MAX2870::ReadFrequencyError() {
   return MAX2870_FrequencyError;
 }
 
-void MAX2870::ReadCurrentFrequency(char *freq)
+long long MAX2870::ReadCurrentFrequency(void)
 {
-  BigNumber::begin(12);
-  char tmpstr[12];
-  ultoa(MAX2870_reffreq, tmpstr, 10);
-  BigNumber BN_ref = BigNumber(tmpstr);
-  if (ReadRDIV2() != 0 && ReadRefDoubler() == 0) {
-    BN_ref /= BigNumber(2);
-  }
-  else if (ReadRDIV2() == 0 && ReadRefDoubler() != 0) {
-    BN_ref *= BigNumber(2);
-  }
-  BN_ref /= BigNumber(ReadR());
-  BigNumber BN_freq = BN_ref;
-  BN_freq *= BigNumber(ReadInt());
-  BN_ref *= BigNumber(ReadFraction());
-  BN_ref /= BigNumber(ReadMod());
-  BN_freq += BN_ref;
-  BN_freq /= BigNumber(ReadOutDivider());
-  BigNumber BN_rounding = BigNumber("0.5");
-  for (int i = 0; i < MAX2870_DECIMAL_PLACES; i++) {
-    BN_rounding /= BigNumber(10);
-  }
-  BN_freq += BN_rounding;
-  char* temp = BN_freq.toString();
-  BigNumber::finish();
-  uint8_t DecimalPlaceToStart;
-  for (int i = 0; i < (MAX2870_DIGITS + 1); i++){
-    freq[i] = temp[i];
-    if (temp[i] == '.') {
-      DecimalPlaceToStart = i;
-      DecimalPlaceToStart++;
+  return MAX2870_currentF;
+
+/*
+  uint16_t CurrentR = ReadR();
+  // external reference optionally *2 or /2
+  uint32_t intRef = MAX2870_reffreq*(1+ReadRefDoubler())/(1+ReadRDIV2());
+  // INT part of fvco
+  long long fvco = (long long)intRef*ReadInt()/CurrentR;
+  // FRAC part of fvco
+  fvco += (long long)intRef*ReadFraction()/((uint32_t)CurrentR*ReadMod());
+  return fvco/ReadOutDivider();
+*/
+}
+
+uint8_t MAX2870::ReadPowerLevel()
+{
+  // output off?
+  if (!(MAX2870_R[4] & 0b100000))
+    return 0;
+  return (uint8_t(MAX2870_R[4] >> 3) & 3)+1;
+}
+
+uint8_t MAX2870::ReadAuxPowerLevel()
+{
+  // output off?
+  if (!(MAX2870_R[4] & 0b100000000))
+    return 0;
+  return (uint8_t(MAX2870_R[4] >> 6) & 3)+1;
+}
+
+void MAX2870::WriteBF_dword(uint8_t offset, uint8_t nBits, uint32_t *pdw, uint16_t insData)
+{
+  uint32_t mask = ((1L<<nBits)-1)<<offset;
+  *pdw = *pdw & ~mask | (insData<<offset) & mask;
+}
+
+void MAX2870::farey(float x, uint16_t max_denominator, uint16_t *pNum, uint16_t *pDen)
+{
+  uint16_t lower_num = 0, lower_den = 1;
+  uint16_t upper_num = 1, upper_den = 1;
+  uint16_t result_num = 0, result_den = 1;
+  float value;
+
+  while (1)
+  {
+    result_num = lower_num + upper_num;
+    result_den = lower_den + upper_den;
+    value = (float)result_num / result_den;
+
+    if (result_den > max_denominator)
+    {
+      // If the denominator exceeds max_denominator, choose among previous best results
+      float lower_value = (float)lower_num / lower_den;
+      float upper_value = (float)upper_num / upper_den;
+      if (x - lower_value < upper_value - x)
+      {
+        result_num = lower_num;
+        result_den = lower_den;
+      }
+      else
+      {
+        result_num = upper_num;
+        result_den = upper_den;
+      }
       break;
     }
+    else if (value == x)
+    {
+        // If the value matches exactly, break
+        break;
+    }
+    else if (value < x)
+    {
+        lower_num = result_num;
+        lower_den = result_den;
+    }
+      else
+    {
+        upper_num = result_num;
+        upper_den = result_den;
+    }
   }
-  for (int i = DecimalPlaceToStart; i < (DecimalPlaceToStart + MAX2870_DECIMAL_PLACES); i++) {
-    freq[i] = temp[i];
-  }
-  freq[(DecimalPlaceToStart + MAX2870_DECIMAL_PLACES)] = 0x00;
-  free(temp);
+
+  // copy result to external vars
+  *pNum = result_num;
+  *pDen = result_den;
 }
 
 void MAX2870::init(uint8_t SSpin, uint8_t LockPinNumber, bool Lock_Pin_Used, uint8_t CEpinNumber, bool CE_Pin_Used)
@@ -186,21 +238,31 @@ void MAX2870::init(uint8_t SSpin, uint8_t LockPinNumber, bool Lock_Pin_Used, uin
     pinMode(LockPinNumber, INPUT_PULLUP) ;
   }
   SPI.begin();
+
+  // initialize chip as recommended in the datasheet
+  // RF outputs are disabled on default values
+  SPI.beginTransaction(MAX2870_SPI);
+  SPI.setClockDivider(255); // 329 kHz not working with SPISettings... (?)
+  for (int j = 0 ; j < 2 ; j++) {
+    for (int i=5; i>=0; i--)
+    {
+      uint8_t *pReg = (uint8_t *)(MAX2870_R+i);
+      digitalWrite(MAX2870_PIN_SS, LOW);
+      delayMicroseconds(1);
+      SPI.transfer(pReg[3]);
+      SPI.transfer(pReg[2]);
+      SPI.transfer(pReg[1]);
+      SPI.transfer(pReg[0]);
+      delayMicroseconds(1);
+      digitalWrite(MAX2870_PIN_SS, HIGH);
+      delayMicroseconds(1);
+    }
+    delay(25);  // at least 20 ms delay
+  }
+  SPI.endTransaction();
 }
 
-int MAX2870::SetStepFreq(uint32_t value) {
-  if (value > ReadPFDfreq()) {
-    return MAX2870_ERROR_STEP_FREQUENCY_EXCEEDS_PFD;
-  }
-  uint16_t Rvalue = ReadR();
-  if (Rvalue == 0 || (MAX2870_reffreq % value) != 0) {
-    return MAX2870_ERROR_PFD_AND_STEP_FREQUENCY_HAS_REMAINDER;
-  }
-  MAX2870_ChanStep = value;
-  return MAX2870_ERROR_NONE;
-}
-
-int  MAX2870::setf(char *freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_t AuxFrequencyDivider, bool PrecisionFrequency, uint32_t MaximumFrequencyError, uint32_t CalculationTimeout) {
+int  MAX2870::setf(long long freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_t AuxFrequencyDivider) {
   //  calculate settings from freq
   if (PowerLevel < 0 || PowerLevel > 4) return MAX2870_ERROR_POWER_LEVEL;
   if (AuxPowerLevel < 0 || AuxPowerLevel > 4) return MAX2870_ERROR_AUX_POWER_LEVEL;
@@ -209,206 +271,66 @@ int  MAX2870::setf(char *freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_
 
   uint32_t ReferenceFrequency = MAX2870_reffreq;
   ReferenceFrequency /= ReadR();
-  if (PrecisionFrequency == false && MAX2870_ChanStep > 1 && (ReferenceFrequency % MAX2870_ChanStep) != 0) {
-    return MAX2870_ERROR_PFD_AND_STEP_FREQUENCY_HAS_REMAINDER;
-  }
 
-  BigNumber::begin(12); // for a maximum 105 MHz PFD and a 128 RF divider with frequency steps no smaller than 1 Hz, will fit the maximum of 13.44 * (10 ^ 9) for the MOD and FRAC before GCD calculation
-
-  if (BigNumber(freq) > BigNumber("6000000000") || BigNumber(freq) < BigNumber("23437500")) {
-    BigNumber::finish();
+  if (freq > 6000000000LL || freq < 23437500L)
     return MAX2870_ERROR_RF_FREQUENCY;
-  }
 
-  uint8_t FrequencyPointer = 0;
-  while (true) { // null out any decimal places below 1 Hz increments to avoid GCD calculation input overflow
-    if (freq[FrequencyPointer] == '.') { // change the decimal point to a null terminator
-      freq[FrequencyPointer] = 0x00;
-      break;
-    }
-    if (freq[FrequencyPointer] == 0x00) { // null terminator reached
-      break;
-    }
-    FrequencyPointer++;
-  }
-
-  char tmpstr[12]; // will fit a long including sign and terminator
-
-  if (PrecisionFrequency == false && MAX2870_ChanStep > 1) {
-    ultoa(MAX2870_ChanStep, tmpstr, 10);
-    BigNumber BN_freq = BigNumber(freq);
-    // BigNumber has issues with modulus calculation which always results in 0
-    BN_freq /= BigNumber(tmpstr);
-    uint32_t ChanSteps = (uint32_t)((uint32_t) BN_freq); // round off the decimal - overflow is not an issue for the MAX2870 frequency range
-    ultoa(ChanSteps, tmpstr, 10);
-    BN_freq -= BigNumber(tmpstr);
-    if (BN_freq != BigNumber(0)) {
-      BigNumber::finish();
-      return MAX2870_ERROR_RF_FREQUENCY_AND_STEP_FREQUENCY_HAS_REMAINDER;
-    }
-  }
-
-  BigNumber BN_localosc_ratio = BigNumber("3000000000") / BigNumber(freq);
-  uint8_t localosc_ratio = (uint32_t)((uint32_t) BN_localosc_ratio);
   uint8_t MAX2870_outdiv = 1 ;
   uint8_t MAX2870_RfDivSel = 0 ;
   uint32_t MAX2870_N_Int;
-  uint32_t MAX2870_Mod = 2;
-  uint32_t MAX2870_Frac = 0;
+  uint16_t MAX2870_Mod = 2;
+  uint16_t MAX2870_Frac = 0;
 
-  ultoa(MAX2870_reffreq, tmpstr, 10);
-  word CurrentR = ReadR();
+  uint16_t CurrentR = ReadR();
   uint8_t RDIV2 = ReadRDIV2();
   uint8_t RefDoubler = ReadRefDoubler();
-  BigNumber BN_MAX2870_PFDFreq = (BigNumber(tmpstr) * (BigNumber(1) * BigNumber((1 + RefDoubler))) * (BigNumber(1) / BigNumber((1 + RDIV2)))) / BigNumber(CurrentR);
-  uint32_t PFDFreq = (uint32_t)((uint32_t) BN_MAX2870_PFDFreq); // used for checking maximum PFD limit under Fractional Mode
-
+  uint32_t intRef = MAX2870_reffreq*(1+RefDoubler)/(1+RDIV2);
+  uint32_t PFDfreq = intRef/CurrentR; // not used for coeff. computation due to truncation
+  
   // select the output divider
-  if (BigNumber(freq) > BigNumber("23437500")) {
-    while (MAX2870_outdiv <= localosc_ratio && MAX2870_outdiv <= 64) {
-      MAX2870_outdiv *= 2;
-      MAX2870_RfDivSel++;
-    }
-  }
-  else {
-    MAX2870_outdiv = 128;
-    MAX2870_RfDivSel = 7;
-  }
+  MAX2870_outdiv = (uint8_t)(6000000000LL / (freq+1)); // +1, so e.g. 3000 MHz gets divided by 1
+  if (MAX2870_outdiv >= 128) { MAX2870_outdiv = 128; MAX2870_RfDivSel=7; }
+  else if (MAX2870_outdiv >= 64) { MAX2870_outdiv = 64; MAX2870_RfDivSel=6; }
+  else if (MAX2870_outdiv >= 32) { MAX2870_outdiv = 32; MAX2870_RfDivSel=5; }
+  else if (MAX2870_outdiv >= 16) { MAX2870_outdiv = 16; MAX2870_RfDivSel=4; }
+  else if (MAX2870_outdiv >= 8) { MAX2870_outdiv = 8; MAX2870_RfDivSel=3; }
+  else if (MAX2870_outdiv >= 4) { MAX2870_outdiv = 4; MAX2870_RfDivSel=2; }
+  else if (MAX2870_outdiv >= 2) { MAX2870_outdiv = 2; MAX2870_RfDivSel=1; }
+  else { MAX2870_outdiv = 1; MAX2870_RfDivSel=0; }
 
-  bool CalculationTookTooLong = false;
-  BigNumber BN_MAX2870_N_Int = (BigNumber(freq) / BN_MAX2870_PFDFreq) * BigNumber(MAX2870_outdiv); // for 4007.5 MHz RF/10 MHz PFD, result is 400.75;
-  MAX2870_N_Int = (uint32_t)((uint32_t) BN_MAX2870_N_Int); // round off the decimal
-  ultoa(MAX2870_N_Int, tmpstr, 10);
-  BigNumber BN_FrequencyRemainder;
-  if (PrecisionFrequency == true) { // frequency is 4007.5 MHz, PFD is 10 MHz and output divider is 2
-    uint32_t CalculationTimeStart = millis();
-    BN_FrequencyRemainder = ((BN_MAX2870_PFDFreq * BigNumber(tmpstr)) / BigNumber(MAX2870_outdiv)) - BigNumber(freq); // integer is 4000 MHz, remainder is -7.5 MHz and will be converterd to a positive
-    if (BN_FrequencyRemainder < BigNumber(0)) {
-      BN_FrequencyRemainder *= BigNumber("-1"); // convert to a postivie
-    }
-    BigNumber BN_MAX2870_N_Int_Overflow = (BN_MAX2870_N_Int + BigNumber("0.00024421")); // deal with N having remainder greater than (4094 / 4095) and a frequency within ((PFD - (PFD * (1 / 4095)) / output divider)
-    uint32_t MAX2870_N_Int_Overflow = (uint32_t)((uint32_t) BN_MAX2870_N_Int_Overflow);
-    if (MAX2870_N_Int_Overflow == MAX2870_N_Int) { // deal with N having remainder greater than (4094 / 4095) and a frequency within ((PFD - (PFD * (1 / 4095)) / output divider)
-      MAX2870_FrequencyError = (int32_t)((int32_t) BN_FrequencyRemainder); // initial value should the MOD match loop fail to result in FRAC < MOD
-      if (MAX2870_FrequencyError > MaximumFrequencyError) { // use fractional division if out of tolerance
-        uint32_t FreqeucnyError = MAX2870_FrequencyError;
-        uint32_t PreviousFrequencyError = MAX2870_FrequencyError;
-        for (word ModToMatch = 2; ModToMatch <= 4095; ModToMatch++) {
-          if (CalculationTimeout > 0) {
-            uint32_t CalculationTime = millis();
-            CalculationTime -= CalculationTimeStart;
-            if (CalculationTime > CalculationTimeout) {
-              CalculationTookTooLong = true;
-              break;
-            }
-          }
-          BigNumber BN_ModFrequencyStep = BN_MAX2870_PFDFreq / BigNumber(ModToMatch) / BigNumber(MAX2870_outdiv); // For 4007.5 MHz RF/10 MHz PFD, should be 4
-          BigNumber BN_TempFrac = (BN_FrequencyRemainder / BN_ModFrequencyStep) + BigNumber("0.5"); // result should be 3 to correspond with above line
-          uint32_t TempFrac = (uint32_t)((uint32_t) BN_TempFrac);
-          if (TempFrac <= ModToMatch) { // FRAC must be < MOD
-            if (TempFrac == ModToMatch) { // FRAC must be < MOD
-              TempFrac--;
-            }
-            ultoa(TempFrac, tmpstr, 10);
-            BigNumber BN_FrequencyError = (BN_FrequencyRemainder - (BigNumber(tmpstr) * BN_ModFrequencyStep));
-            if (BN_FrequencyError < BigNumber(0)) {
-              BN_FrequencyError *= BigNumber("-1"); // convert to a postivie
-            }
-            MAX2870_FrequencyError = (int32_t)((int32_t) BN_FrequencyError);
-            if (MAX2870_FrequencyError < PreviousFrequencyError) {
-              PreviousFrequencyError = MAX2870_FrequencyError;
-              MAX2870_Mod = ModToMatch; // result should be 4 for 4007.5 MHz/10 MHz PFD
-              MAX2870_Frac = TempFrac; // result should be 3 to correspond with above line
-            }
-            if (MAX2870_FrequencyError <= MaximumFrequencyError) { // tolerance has been obtained - for 4007.5 MHz, MOD = 4, FRAC = 3; error = 0
-              break;
-            }
-          }
-        }
-      }
-    }
-    else {
+  long long fvcoTarget = freq*MAX2870_outdiv;
+
+  // compute N_int
+  MAX2870_N_Int = (uint16_t)(fvcoTarget*CurrentR/intRef);
+  // compute actual frequency in int mode
+  long long fvco = (long long)intRef*MAX2870_N_Int/CurrentR;
+  // compute residual F/M (0..1)
+  float res = float(fvcoTarget - fvco)*CurrentR/intRef;
+  // put in best fraction form
+  farey(res, 4095, &MAX2870_Frac, &MAX2870_Mod);
+  // checks
+  if (MAX2870_Mod == 1)
+  {
+    MAX2870_Mod = 2;  // minimum
+    if (MAX2870_Frac == 1)
+    {
+      // best approx was 1/1, so we revert to 0/2 and increment N
+      MAX2870_Frac = 0;
       MAX2870_N_Int++;
+      fvco = (long long)intRef*MAX2870_N_Int/CurrentR;
     }
-    ultoa(MAX2870_N_Int, tmpstr, 10);
   }
-  else {
-    BN_MAX2870_N_Int = (((BigNumber(freq) * BigNumber(MAX2870_outdiv))) / BN_MAX2870_PFDFreq);
-    MAX2870_N_Int = (uint32_t)((uint32_t) BN_MAX2870_N_Int);
-    ultoa(MAX2870_ChanStep, tmpstr, 10);
-    BigNumber BN_MAX2870_Mod = (BN_MAX2870_PFDFreq / (BigNumber(tmpstr) / BigNumber(MAX2870_outdiv)));
-    ultoa(MAX2870_N_Int, tmpstr, 10);
-    BigNumber BN_MAX2870_Frac = (((BN_MAX2870_N_Int - BigNumber(tmpstr)) * BN_MAX2870_Mod) + BigNumber("0.5"));
-    // for a maximum 105 MHz PFD and a 128 RF divider with frequency steps no smaller than 1 Hz, maximum results for each is 13.44 * (10 ^ 9) but can be divided by the RF division ratio without error (results will be no larger than 105 * (10 ^ 6))
-    BN_MAX2870_Frac /= BigNumber(MAX2870_outdiv);
-    BN_MAX2870_Mod /= BigNumber(MAX2870_outdiv);
-
-    // calculate the GCD - Mod2/Frac2 values are temporary
-    uint32_t GCD_MAX2870_Mod2 = (uint32_t)((uint32_t) BN_MAX2870_Mod);
-    uint32_t GCD_MAX2870_Frac2 = (uint32_t)((uint32_t) BN_MAX2870_Frac);
-    uint32_t GCD_t;
-    while (true) {
-      if (GCD_MAX2870_Mod2 == 0) {
-        GCD_t = GCD_MAX2870_Frac2;
-        break;
-      }
-      if (GCD_MAX2870_Frac2 == 0) {
-        GCD_t = GCD_MAX2870_Mod2;
-        break;
-      }
-      if (GCD_MAX2870_Mod2 == GCD_MAX2870_Frac2) {
-        GCD_t = GCD_MAX2870_Mod2;
-        break;
-      }
-      if (GCD_MAX2870_Mod2 > GCD_MAX2870_Frac2) {
-        GCD_MAX2870_Mod2 -= GCD_MAX2870_Frac2;
-      }
-      else {
-        GCD_MAX2870_Frac2 -= GCD_MAX2870_Mod2;
-      }
-    }
-    // restore the original Mod2/Frac2 temporary values before dividing by GCD
-    GCD_MAX2870_Mod2 = (uint32_t)((uint32_t) BN_MAX2870_Mod);
-    GCD_MAX2870_Frac2 = (uint32_t)((uint32_t) BN_MAX2870_Frac);
-    GCD_MAX2870_Mod2 /= GCD_t;
-    GCD_MAX2870_Frac2 /= GCD_t;
-    if (GCD_MAX2870_Mod2 > 4095) { // outside valid range
-      while (true) {
-        GCD_MAX2870_Mod2 /= 2;
-        GCD_MAX2870_Frac2 /= 2;
-        if (GCD_MAX2870_Mod2 <= 4095) { // now within valid range
-          if (GCD_MAX2870_Frac2 == GCD_MAX2870_Mod2) { // FRAC must be less than MOD
-            GCD_MAX2870_Frac2--;
-          }
-          break;
-        }
-      }
-    }
-    // set the final FRAC/MOD values
-    MAX2870_Frac = GCD_MAX2870_Frac2;
-    MAX2870_Mod = GCD_MAX2870_Mod2;
-  }
-  if (CalculationTookTooLong == true) {
-    BigNumber::finish();
-    return MAX2870_ERROR_PRECISION_FREQUENCY_CALCULATION_TIMEOUT;
-  }
-
-  BN_FrequencyRemainder = (((((BN_MAX2870_PFDFreq * BigNumber(tmpstr)) + (BigNumber(MAX2870_Frac) * (BN_MAX2870_PFDFreq / BigNumber(MAX2870_Mod)))) / BigNumber(MAX2870_outdiv))) - BigNumber(freq)) + BigNumber("0.5"); // no issue with divide by 0 regarding MOD (set to 2 by default) and FRAC (set to 0 by default) - maximum is PFD maximum frequency of 105 MHz under integer mode - no issues with signed overflow or underflow
-  MAX2870_FrequencyError = (int32_t)((int32_t) BN_FrequencyRemainder);
-
-  BigNumber::finish();
-
-  if (MAX2870_Frac == 0) { // correct the MOD to the minimum required value
-    MAX2870_Mod = 2;
-  }
-
-  if ( MAX2870_Mod < 2 || MAX2870_Mod > 4095) {
+  if (MAX2870_Frac >= MAX2870_Mod)
+    MAX2870_Frac = MAX2870_Mod-1; // maximum
+  
+  if (MAX2870_Mod > 4095) {
     return MAX2870_ERROR_MOD_RANGE;
   }
 
-  if ( (uint32_t) MAX2870_Frac > (MAX2870_Mod - 1) ) {
-    return MAX2870_ERROR_FRAC_RANGE;
-  }
+  // compute actual frequency
+  fvco += (long long)intRef*MAX2870_Frac/((uint32_t)CurrentR*MAX2870_Mod);
+  MAX2870_currentF = fvco/MAX2870_outdiv;
+  MAX2870_FrequencyError = (int32_t)(freq - MAX2870_currentF);
 
   if (MAX2870_Frac == 0 && (MAX2870_N_Int < 16  || MAX2870_N_Int > 65535)) {
     return MAX2870_ERROR_N_RANGE;
@@ -418,37 +340,40 @@ int  MAX2870::setf(char *freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_
     return MAX2870_ERROR_N_RANGE_FRAC;
   }
 
-  if (MAX2870_Frac != 0 && PFDFreq > MAX2870_PFD_MAX_FRAC) {
+  if (MAX2870_Frac != 0 && PFDfreq > MAX2870_PFD_MAX_FRAC) {
     return MAX2870_ERROR_PFD_EXCEEDED_WITH_FRACTIONAL_MODE;
   }
 
-  MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(3, 12, MAX2870_R[0x00], MAX2870_Frac);
-  MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(15, 16, MAX2870_R[0x00], MAX2870_N_Int);
+  MAX2870_R[0] = uint32_t(MAX2870_Frac) << 3;
+  MAX2870_R[0] |= uint32_t(MAX2870_N_Int) << 15;
 
   if (MAX2870_Frac == 0) {
-    MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x00], 1); // integer-n mode
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(29, 2, MAX2870_R[0x01], 0); // Charge Pump Linearity
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x01], 1); // Charge Pump Output Clamp
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x02], 1); // Lock Detect Function, int-n mode
-    MAX2870_R[0x05] = BitFieldManipulation.WriteBF_dword(24, 1, MAX2870_R[0x05], 1); // integer-n mode
+    MAX2870_R[0] |= 0x80000000L; // integer-n mode
+    WriteBF_dword(29, 2, MAX2870_R+1, 0); // Charge Pump Linearity disable for INT mode
+    WriteBF_dword(31, 1, MAX2870_R+1, 1); // CP clamp enable (improved INT phase noise)
+    WriteBF_dword(8, 1, MAX2870_R+2, 1); // Lock Detect Function, int-n mode
+    WriteBF_dword(24, 1, MAX2870_R+5, 0); // F01 not used in INT mode
   }
   else {
-    MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x00], 0); // fractional-n mode
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(29, 2, MAX2870_R[0x01], 1); // Charge Pump Linearity
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x01], 0); // Charge Pump Output Clamp
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x02], 0); // Lock Detect Function, frac-n mode
-    MAX2870_R[0x05] = BitFieldManipulation.WriteBF_dword(24, 1, MAX2870_R[0x05], 0); // fractional-n mode
+    WriteBF_dword(29, 2, MAX2870_R+1, 1); // Charge Pump Linearity enable for FRAC mode
+    WriteBF_dword(31, 1, MAX2870_R+1, 0); // CP clamp disable in FRAC mode
+    WriteBF_dword(8, 1, MAX2870_R+2, 0); // Lock Detect Function, frac-n mode
+    WriteBF_dword(24, 1, MAX2870_R+5, 1); // F01 auto switch to INT if F==0
   }
+  if (PFDfreq > 32000000L)
+    WriteBF_dword(31, 1, MAX2870_R+2, 1); // lock detect speed
+  else
+    WriteBF_dword(31, 1, MAX2870_R+2, 0); // lock detect speed
   // (0x01, 15, 12, 1) phase
-  MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(3, 12, MAX2870_R[0x01], MAX2870_Mod);
+  WriteBF_dword(3, 12, MAX2870_R+1, MAX2870_Mod);
   // (0x02, 3,1,0) counter reset
   // (0x02, 4,1,0) cp3 state
   // (0x02, 5,1,0) power down
-  if (PFDFreq > 32000000UL) { // lock detect speed adjustment
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x02], 1); // Lock Detect Speed
+  if (PFDfreq > 32000000UL) { // lock detect speed adjustment
+    WriteBF_dword(31, 1, MAX2870_R+2, 1); // Lock Detect Speed
   }
   else  {
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x02], 0); // Lock Detect Speed
+    WriteBF_dword(31, 1, MAX2870_R+2, 0); // Lock Detect Speed
   }
   // (0x02, 13,1,0) dbl buf
   // (0x02, 26,3,0) //  muxout, not used
@@ -460,26 +385,26 @@ int  MAX2870::setf(char *freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_
   // (0x03, 25,1,0) VAS state machine
   // (0x03, 26,6,0) VCO and VCO sub-band manual selection
   if (PowerLevel == 0) {
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(5, 1, MAX2870_R[0x04], 0);
+    WriteBF_dword(5, 1, MAX2870_R+4, 0);  // output disabled
   }
   else {
     PowerLevel--;
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(5, 1, MAX2870_R[0x04], 1);
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(3, 2, MAX2870_R[0x04], PowerLevel);
+    WriteBF_dword(5, 1, MAX2870_R+4, 1);  // output enabled
+    WriteBF_dword(3, 2, MAX2870_R+4, PowerLevel);
   }
   if (AuxPowerLevel == 0) {
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x04], 0);
+    WriteBF_dword(8, 1, MAX2870_R+4, 0);
   }
   else {
     AuxPowerLevel--;
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(6, 2, MAX2870_R[0x04], AuxPowerLevel);
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x04], 1);
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(9, 1, MAX2870_R[0x04], AuxFrequencyDivider);
+    WriteBF_dword(6, 2, MAX2870_R+4, AuxPowerLevel);
+    WriteBF_dword(8, 1, MAX2870_R+4, 1);
+    WriteBF_dword(9, 1, MAX2870_R+04, AuxFrequencyDivider);
   }
   // (0x04, 10,1,0) reserved
   // (0x04, 11,1,0) reserved
   // (0x04, 12,8,1) Band Select Clock Divider
-  MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(20, 3, MAX2870_R[0x04], MAX2870_RfDivSel); // rf divider select
+  WriteBF_dword(20, 3, MAX2870_R+4, MAX2870_RfDivSel); // rf divider select
   // (0x04, 23,8,0) reserved
   // (0x04, 24,2,1) Band Select Clock Divider MSBs
   // (0x04, 26,6,1) reserved
@@ -489,19 +414,103 @@ int  MAX2870::setf(char *freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_
   // (0x05, 25,7,0) reserved
   WriteRegs();
 
-  bool NegativeError = false;
-  if (MAX2870_FrequencyError < 0) { // convert to a positive for frequency error comparison with a positive value
-    MAX2870_FrequencyError ^= 0xFFFFFFFF;
-    MAX2870_FrequencyError++;
-    NegativeError = true;
-  }
-  if ((PrecisionFrequency == true && MAX2870_FrequencyError > MaximumFrequencyError) || (PrecisionFrequency == false && MAX2870_FrequencyError != 0)) {
-    if (NegativeError == true) { // convert back to negative if changed from negative to positive for frequency error comparison with a positive value
-      MAX2870_FrequencyError ^= 0xFFFFFFFF;
-      MAX2870_FrequencyError++;
+  return MAX2870_ERROR_NONE; // ok
+}
+
+// simplified setf with only f changing
+int MAX2870::sweepStep(long long freq) {
+  if (freq > 6000000000LL || freq < 23437500L)
+    return MAX2870_ERROR_RF_FREQUENCY;
+
+  uint8_t MAX2870_outdiv = 1 ;
+  uint8_t MAX2870_RfDivSel = 0 ;
+  uint32_t MAX2870_N_Int;
+  uint16_t MAX2870_Mod = 2;
+  uint16_t MAX2870_Frac = 0;
+
+  uint16_t CurrentR = ReadR();
+  uint8_t RDIV2 = ReadRDIV2();
+  uint8_t RefDoubler = ReadRefDoubler();
+  uint32_t intRef = MAX2870_reffreq*(1+RefDoubler)/(1+RDIV2);
+  uint32_t PFDfreq = intRef/CurrentR; // not used for coeff. computation due to truncation
+  
+  // select the output divider
+  MAX2870_outdiv = (uint8_t)(6000000000LL / (freq+1)); // +1, so e.g. 3000 MHz gets divided by 1
+  if (MAX2870_outdiv >= 128) { MAX2870_outdiv = 128; MAX2870_RfDivSel=7; }
+  else if (MAX2870_outdiv >= 64) { MAX2870_outdiv = 64; MAX2870_RfDivSel=6; }
+  else if (MAX2870_outdiv >= 32) { MAX2870_outdiv = 32; MAX2870_RfDivSel=5; }
+  else if (MAX2870_outdiv >= 16) { MAX2870_outdiv = 16; MAX2870_RfDivSel=4; }
+  else if (MAX2870_outdiv >= 8) { MAX2870_outdiv = 8; MAX2870_RfDivSel=3; }
+  else if (MAX2870_outdiv >= 4) { MAX2870_outdiv = 4; MAX2870_RfDivSel=2; }
+  else if (MAX2870_outdiv >= 2) { MAX2870_outdiv = 2; MAX2870_RfDivSel=1; }
+  else { MAX2870_outdiv = 1; MAX2870_RfDivSel=0; }
+
+  long long fvcoTarget = freq*MAX2870_outdiv;
+
+  // compute N_int
+  MAX2870_N_Int = (uint16_t)(fvcoTarget*CurrentR/intRef);
+  // compute actual frequency in int mode
+  long long fvco = (long long)intRef*MAX2870_N_Int/CurrentR;
+  // compute residual F/M (0..1)
+  float res = float(fvcoTarget - fvco)*CurrentR/intRef;
+  // put in best fraction form
+  farey(res, 4095, &MAX2870_Frac, &MAX2870_Mod);
+  // checks
+  if (MAX2870_Mod == 1)
+  {
+    MAX2870_Mod = 2;  // minimum
+    if (MAX2870_Frac == 1)
+    {
+      // best approx was 1/1, so we revert to 0/2 and increment N
+      MAX2870_Frac = 0;
+      MAX2870_N_Int++;
+      fvco = (long long)intRef*MAX2870_N_Int/CurrentR;
     }
-    return MAX2870_WARNING_FREQUENCY_ERROR;
   }
+  if (MAX2870_Frac >= MAX2870_Mod)
+    MAX2870_Frac = MAX2870_Mod-1; // maximum
+  
+  if (MAX2870_Mod > 4095) {
+    return MAX2870_ERROR_MOD_RANGE;
+  }
+
+  // compute actual frequency
+  fvco += (long long)intRef*MAX2870_Frac/((uint32_t)CurrentR*MAX2870_Mod);
+  MAX2870_currentF = fvco/MAX2870_outdiv;
+  MAX2870_FrequencyError = (int32_t)(freq - MAX2870_currentF);
+
+  if (MAX2870_Frac == 0 && (MAX2870_N_Int < 16  || MAX2870_N_Int > 65535)) {
+    return MAX2870_ERROR_N_RANGE;
+  }
+
+  if (MAX2870_Frac != 0 && (MAX2870_N_Int < 19  || MAX2870_N_Int > 4091)) {
+    return MAX2870_ERROR_N_RANGE_FRAC;
+  }
+
+  if (MAX2870_Frac != 0 && PFDfreq > MAX2870_PFD_MAX_FRAC) {
+    return MAX2870_ERROR_PFD_EXCEEDED_WITH_FRACTIONAL_MODE;
+  }
+
+  // we need to update only registers involved in a frequency change
+  MAX2870_R[0] = uint32_t(MAX2870_Frac) << 3;
+  MAX2870_R[0] |= uint32_t(MAX2870_N_Int) << 15;
+
+  if (MAX2870_Frac == 0) {
+    MAX2870_R[0] |= 0x80000000L; // integer-n mode
+    WriteBF_dword(29, 2, MAX2870_R+1, 0); // Charge Pump Linearity disable for INT mode
+    WriteBF_dword(31, 1, MAX2870_R+1, 1); // CP clamp enable (improved INT phase noise)
+    WriteBF_dword(8, 1, MAX2870_R+2, 1); // Lock Detect Function, int-n mode
+    WriteBF_dword(24, 1, MAX2870_R+5, 0); // F01 not used in INT mode
+  }
+  else {
+    WriteBF_dword(29, 2, MAX2870_R+1, 1); // Charge Pump Linearity enable for FRAC mode
+    WriteBF_dword(31, 1, MAX2870_R+1, 0); // CP clamp disable in FRAC mode
+    WriteBF_dword(8, 1, MAX2870_R+2, 0); // Lock Detect Function, frac-n mode
+    WriteBF_dword(24, 1, MAX2870_R+5, 1); // F01 auto switch to INT if F==0
+  }
+  WriteBF_dword(3, 12, MAX2870_R+1, MAX2870_Mod);
+  WriteBF_dword(20, 3, MAX2870_R+4, MAX2870_RfDivSel); // rf divider select
+  WriteRegs();
 
   return MAX2870_ERROR_NONE; // ok
 }
@@ -513,27 +522,28 @@ int MAX2870::setrf(uint32_t f, uint16_t r, uint8_t ReferenceDivisionType)
   if (f < MAX2870_REFIN_MIN || f > MAX2870_REFIN_MAX) return MAX2870_ERROR_REF_FREQUENCY;
   if (ReferenceDivisionType != MAX2870_REF_UNDIVIDED && ReferenceDivisionType != MAX2870_REF_HALF && ReferenceDivisionType != MAX2870_REF_DOUBLE) return MAX2870_ERROR_REF_MULTIPLIER_TYPE;
 
-  double ReferenceFactor = 1;
+  uint32_t newF;
   if (ReferenceDivisionType == MAX2870_REF_HALF) {
-    ReferenceFactor /= 2;
+    newF = f/2/r;
   }
   else if (ReferenceDivisionType == MAX2870_REF_DOUBLE) {
-    ReferenceFactor *= 2;
+    newF = f*2/r;
   }
-  double newfreq  =  (double) f  * ( (double) ReferenceFactor / (double) r);  // check the loop freq
-
-  if ( newfreq > MAX2870_PFD_MAX || newfreq < MAX2870_PFD_MIN ) return MAX2870_ERROR_PFD_LIMITS;
+  else
+    newF = f/r;
+  
+  if ( newF > MAX2870_PFD_MAX || newF < MAX2870_PFD_MIN ) return MAX2870_ERROR_PFD_LIMITS;
 
   MAX2870_reffreq = f ;
-  MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(14, 10, MAX2870_R[0x02], r);
+  WriteBF_dword(14, 10, MAX2870_R+2, r);
   if (ReferenceDivisionType == MAX2870_REF_DOUBLE) {
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(24, 2, MAX2870_R[0x02], 0b00000010);
+    WriteBF_dword(24, 2, MAX2870_R+2, 0b00000010);
   }
   else if (ReferenceDivisionType == MAX2870_REF_HALF) {
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(24, 2, MAX2870_R[0x02], 0b00000001);
+    WriteBF_dword(24, 2, MAX2870_R+2, 0b00000001);
   }
   else {
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(24, 2, MAX2870_R[0x02], 0b00000000);
+    WriteBF_dword(24, 2, MAX2870_R+2, 0b00000000);
   }
   return MAX2870_ERROR_NONE;
 }
@@ -565,24 +575,24 @@ void MAX2870::setfDirect(uint16_t R_divider, uint16_t INT_value, uint16_t MOD_va
       RF_DIVIDER_value = 7;
       break;
   }
-  MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(14, 10, MAX2870_R[0x02], R_divider);
-  MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(15, 16, MAX2870_R[0x00], INT_value);
-  MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(3, 12, MAX2870_R[0x01], MOD_value);
-  MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(3, 12, MAX2870_R[0x00], FRAC_value);
-  MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(20, 3, MAX2870_R[0x04], RF_DIVIDER_value);
+  WriteBF_dword(14, 10, MAX2870_R+2, R_divider);
+  WriteBF_dword(15, 16, MAX2870_R, INT_value);
+  WriteBF_dword(3, 12, MAX2870_R+1, MOD_value);
+  WriteBF_dword(3, 12, MAX2870_R, FRAC_value);
+  WriteBF_dword(20, 3, MAX2870_R+4, RF_DIVIDER_value);
   if (FRACTIONAL_MODE == false) {
-    MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x00], 1); // integer-n mode
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(29, 2, MAX2870_R[0x01], 0); // Charge Pump Linearity
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x01], 1); // Charge Pump Output Clamp
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x02], 1); // Lock Detect Function, int-n mode
-    MAX2870_R[0x05] = BitFieldManipulation.WriteBF_dword(24, 1, MAX2870_R[0x05], 1); // integer-n mode
+    WriteBF_dword(31, 1, MAX2870_R, 1); // integer-n mode
+    WriteBF_dword(29, 2, MAX2870_R+1, 0); // Charge Pump Linearity
+    WriteBF_dword(31, 1, MAX2870_R+1, 1); // Charge Pump Output Clamp
+    WriteBF_dword(8, 1, MAX2870_R+2, 1); // Lock Detect Function, int-n mode
+    WriteBF_dword(24, 1, MAX2870_R+5, 1); // integer-n mode
   }
   else {
-    MAX2870_R[0x00] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x00], 0); // frac-n mode
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(29, 2, MAX2870_R[0x01], 1); // Charge Pump Linearity
-    MAX2870_R[0x01] = BitFieldManipulation.WriteBF_dword(31, 1, MAX2870_R[0x01], 0); // Charge Pump Output Clamp
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x02], 0); // Lock Detect Function, frac-n mode
-    MAX2870_R[0x05] = BitFieldManipulation.WriteBF_dword(24, 1, MAX2870_R[0x05], 0); // frac-n mode
+    WriteBF_dword(31, 1, MAX2870_R, 0); // frac-n mode
+    WriteBF_dword(29, 2, MAX2870_R+1, 1); // Charge Pump Linearity
+    WriteBF_dword(31, 1, MAX2870_R+1, 0); // Charge Pump Output Clamp
+    WriteBF_dword(8, 1, MAX2870_R+2, 0); // Lock Detect Function, frac-n mode
+    WriteBF_dword(24, 1, MAX2870_R+5, 0); // frac-n mode
   }
   WriteRegs();
 }
@@ -590,12 +600,12 @@ void MAX2870::setfDirect(uint16_t R_divider, uint16_t INT_value, uint16_t MOD_va
 int MAX2870::setPowerLevel(uint8_t PowerLevel) {
   if (PowerLevel < 0 && PowerLevel > 4) return MAX2870_ERROR_POWER_LEVEL;
   if (PowerLevel == 0) {
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(5, 1, MAX2870_R[0x04], 0);
+    WriteBF_dword(5, 1, MAX2870_R+4, 0);
   }
   else {
     PowerLevel--;
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(5, 1, MAX2870_R[0x04], 1);
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(3, 2, MAX2870_R[0x04], PowerLevel);
+    WriteBF_dword(5, 1, MAX2870_R+4, 1);
+    WriteBF_dword(3, 2, MAX2870_R+4, PowerLevel);
   }
   WriteRegs();
   return MAX2870_ERROR_NONE;
@@ -604,12 +614,12 @@ int MAX2870::setPowerLevel(uint8_t PowerLevel) {
 int MAX2870::setAuxPowerLevel(uint8_t PowerLevel) {
   if (PowerLevel < 0 && PowerLevel > 4) return MAX2870_ERROR_POWER_LEVEL;
   if (PowerLevel == 0) {
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x04], 0);
+    WriteBF_dword(8, 1, MAX2870_R+4, 0);
   }
   else {
     PowerLevel--;
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(6, 2, MAX2870_R[0x04], PowerLevel);
-    MAX2870_R[0x04] = BitFieldManipulation.WriteBF_dword(8, 1, MAX2870_R[0x04], 1);
+    WriteBF_dword(6, 2, MAX2870_R+4, PowerLevel);
+    WriteBF_dword(8, 1, MAX2870_R+4, 1);
   }
   WriteRegs();
   return MAX2870_ERROR_NONE;
@@ -625,14 +635,14 @@ int MAX2870::setCPcurrent(float Current) {
   Current /= 0.32;
   Current -= 0.5; // 0 = 0.32 mA per step rounded
   uint8_t CPcurrent = Current;
-  MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(9, 4, MAX2870_R[0x02], CPcurrent);
+  WriteBF_dword(9, 4, MAX2870_R+2, CPcurrent);
   WriteRegs();
   return MAX2870_ERROR_NONE;
 }
 
 int MAX2870::setPDpolarity(uint8_t PDpolarity) {
   if (PDpolarity == MAX2870_LOOP_TYPE_INVERTING || PDpolarity == MAX2870_LOOP_TYPE_NONINVERTING) {
-    MAX2870_R[0x02] = BitFieldManipulation.WriteBF_dword(6, 1, MAX2870_R[0x02], PDpolarity);
+    WriteBF_dword(6, 1, MAX2870_R+2, PDpolarity);
     WriteRegs();
     return MAX2870_ERROR_NONE;
   }
