@@ -10,9 +10,6 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <stdint.h>
-#include <BigNumber.h>
-#include <BitFieldManipulation.h>
-#include <BeyondByte.h>
 
 #define MAX2870_PFD_MAX   105000000UL      ///< Maximum Frequency for Phase Detector (Integer-N)
 #define MAX2870_PFD_MAX_FRAC   50000000UL  ///< Maximum Frequency for Phase Detector (Fractional-N)
@@ -48,7 +45,7 @@
 #define MAX2870_ERROR_RF_FREQUENCY_AND_STEP_FREQUENCY_HAS_REMAINDER 11
 #define MAX2870_ERROR_PFD_EXCEEDED_WITH_FRACTIONAL_MODE 12
 #define MAX2870_ERROR_PRECISION_FREQUENCY_CALCULATION_TIMEOUT 13
-#define MAX2870_WARNING_FREQUENCY_ERROR 14
+//#define MAX2870_WARNING_FREQUENCY_ERROR 14
 
 // setrf
 #define MAX2870_ERROR_DOUBLER_EXCEEDED 15
@@ -104,7 +101,7 @@ class MAX2870
     */
     uint8_t MAX2870_PIN_SS = 10;   ///< Ard Pin for SPI Slave Select
 
-    MAX2870();
+    MAX2870(uint32_t SPIclock = 500000UL);
     void WriteRegs();
 
     uint16_t ReadR();
@@ -115,12 +112,17 @@ class MAX2870
     uint8_t ReadOutDivider_PowerOf2();
     uint8_t ReadRDIV2();
     uint8_t ReadRefDoubler();
-    double ReadPFDfreq();
+    uint8_t ReadPowerLevel();
+    uint8_t ReadAuxPowerLevel();
+    uint32_t ReadPFDfreq();
     int32_t ReadFrequencyError();
+    
+    void WriteBF_dword(uint8_t offset, uint8_t nBits, uint32_t *pdw, uint16_t insData);
+    void farey(float x, uint16_t max_denominator, uint16_t *pNum, uint16_t *pDen);
 
-    void init(uint8_t SSpin, uint8_t LockPinNumber, bool Lock_Pin_Used, uint8_t CEpin, bool CE_Pin_Used) ;
-    int SetStepFreq(uint32_t value);
-    int setf(char *freq, uint8_t PowerLevel, uint8_t AuxPowerLevel, uint8_t AuxFrequencyDivider, bool PrecisionFrequency, uint32_t FrequencyTolerance, uint32_t CalculationTimeout) ; // set freq and power levels and output mode with option for precision frequency setting with tolerance in Hz
+    void init(uint8_t SSpin, uint8_t LockPinNumber, bool Lock_Pin_Used, uint8_t CEpin, bool CE_Pin_Used);
+    int setf(long long freq, uint8_t PowerLevel=1, uint8_t AuxPowerLevel=0, uint8_t AuxFrequencyDivider=1); // set freq and power levels and output mode with option for precision frequency setting with tolerance in Hz
+    int sweepStep(long long freq);
     void setfDirect(uint16_t R_divider, uint16_t INT_value,uint16_t MOD_value,uint16_t FRAC_value, uint8_t RF_DIVIDER_value, bool FRACTIONAL_MODE);
     int setrf(uint32_t f, uint16_t r, uint8_t ReferenceDivisionType) ; // set reference freq and reference divider (default is 10 MHz with divide by 1)
     int setPowerLevel(uint8_t PowerLevel);
@@ -128,7 +130,7 @@ class MAX2870
 
     void WriteSweepValues(const uint32_t *regs);
     void ReadSweepValues(uint32_t *regs);
-    void ReadCurrentFrequency(char *freq);
+    long long ReadCurrentFrequency(void);
     int setCPcurrent(float Current);
     int setPDpolarity(uint8_t PDpolarity);
 
@@ -137,9 +139,12 @@ class MAX2870
     int32_t MAX2870_FrequencyError = 0;
     // power on defaults
     uint32_t MAX2870_reffreq = MAX2870_REF_FREQ_DEFAULT;
-    uint32_t MAX2870_R[6] {0x007D0000, 0x2000FFF9, 0x18006E42, 0x0000000B, 0x6180B23C, 0x00400005};
-    uint32_t MAX2870_ChanStep = 100000UL;
-
+    // RV: defaults for 100 MHz xtal and 2 MHz fPFD: R=25, divider=HALF NO NEED! @@@@@@
+    // R[2] original 0001 1000 0000 0000 0110 1110 0100 0010 0x18006E42
+    // R[2] modified 0001 1001 0000 0110 0110 1110 0100 0010 0x19066E42
+    // R[4] modified to start disabled
+    uint32_t MAX2870_R[6] {0x007D0000, 0x2000FFF9, 0x18006E42, 0x0000000B, /*0x6180B23C*/0x6180B204, 0x00400005};
+    long long MAX2870_currentF;
 };
 
 #endif
