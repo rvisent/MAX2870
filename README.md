@@ -95,7 +95,7 @@ Notes from the test board: at the lowest output level (-4 dBm, APWR = 00) some V
 
 ### Other projects
 
-The library and the demo are also used in a separate project, a 2-18 GHz source with a variable gain amplifier and a YIG tuned multiplier driven by the MAX2870 (output power levelled from a measured table, automated power measurements); it will be linked here when published.
+The library and the demo are also used in [synth2870](https://github.com/rvisent/synth2870), a 2-18 GHz source with a variable gain amplifier and a YIG tuned multiplier driven by the MAX2870 (output power levelled from a measured table, automated power measurements).
 
 ## Library Use
 
