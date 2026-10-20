@@ -1,23 +1,14 @@
 # MAX2870
-Arduino Library for the MAX2870 Wideband Frequency Synthesizer chip
+Arduino library for the MAX2870 wideband frequency synthesizer (23.5 MHz to 6 GHz, Maxim / Analog Devices), with a demo sketch and a PC control panel. Tested on Arduino Due with the common low-cost MAX2870 boards.
 
-v1.0.0 First release
++ **Exact frequency setting**: the best FRAC/MOD pair is found with an integer-only continued fraction algorithm; the actual frequency and its error are reported after every setting.
++ **Sweeps without unlocking**: a VCO lookup table, calibrated in about 2 s from the VTUNE ADC of the chip, lets sweeps keep the VCO instead of running the 200 us VCO autoselect at every step.
++ **Register 6 readback**: active VCO and VTUNE ADC, checked automatically at startup.
++ **Ready to use**: the demo sketch accepts text commands on the serial port (frequency, power, sweeps, calibration, register dump), and a Python/tkinter control panel drives it.
++ **Practical notes** on the low-cost boards: unused output termination, the -4 dBm level, the readback wiring.
++ No additional libraries required.
 
-v1.0.1 Double buffering of RF frequency divider implemented by default
-
-v1.1.0 Added current frequency read function
-
-v1.1.1 Corrected issue with conversion in ReadCurrentFreq
-
-v1.1.2 Add setPowerLevel function which can be used for frequency bursts
-
-v1.1.3 Added direct entry of frequency parameters for precalculated frequencies of the highest possible precision
-
-v1.1.4 Added configuration of charge pump current and phase detector polarity
-
-v2.0 use of "long long" instead of "BigNumber", also doesn't use BitFieldManipulation and BeyondByte libraries, but internal implementations to increase execution speed. Uses Farey algorithm for fast fractional optimizer. Tested on Arduino Due.
-
-v2.1 SPI clock passed to the constructor is now actually used (previous versions always ran at the SPI library default, 4 MHz on Due). FRAC/MOD computed with an integer-only best rational approximation (continued fractions): always optimal, at most a few tens of iterations, no floating point. setrf() sets the band select clock divider (fBS = 50 kHz as required by the datasheet) and the lock detect speed according to fPFD. Output frequency is computed exactly and rounded to 1 Hz. Register 6 readback, VCO autoselect on/off with manual VCO selection, VCO lookup table calibrated with the VTUNE ADC or the lock detect pin (sweeps without VCO autoselect, no unlock at every step), optional forced fractional mode. Demo sketch with a machine readable serial protocol and a Python control panel.
+Quick start: wire the board to an Arduino Due (LE 48, lock detect 50, CE 52, SPI header; MUX_OUT to MISO for the readback), install the library (see [Installation](#installation)), upload File > Examples > MAX2870 > my2870, then run `python tools/max2870_gui.py` and press CAL once to build the VCO table.
 
 ## Introduction
 
@@ -213,7 +204,27 @@ MAX2870_ERROR_POLARITY_INVALID
 
 
 ## Installation
-Copy (or clone) this repository into the `libraries` folder of your sketchbook as `MAX2870`. For development, a directory link keeps the IDE on the working copy without copying files, e.g. on Windows: `mklink /J "<sketchbook>\libraries\MAX2870" "<path of this repository>"`. Alternatively copy the two files from `src/` into your sketch folder.
+Download the ZIP from GitHub (Code > Download ZIP) and add it with Sketch > Include Library > Add .ZIP Library in the Arduino IDE, or copy (or clone) this repository into the `libraries` folder of your sketchbook as `MAX2870`. For development, a directory link keeps the IDE on the working copy without copying files, e.g. on Windows: `mklink /J "<sketchbook>\libraries\MAX2870" "<path of this repository>"`. Alternatively copy the two files from `src/` into your sketch folder.
+
+## Version history
+
+v1.0.0 First release
+
+v1.0.1 Double buffering of RF frequency divider implemented by default
+
+v1.1.0 Added current frequency read function
+
+v1.1.1 Corrected issue with conversion in ReadCurrentFreq
+
+v1.1.2 Add setPowerLevel function which can be used for frequency bursts
+
+v1.1.3 Added direct entry of frequency parameters for precalculated frequencies of the highest possible precision
+
+v1.1.4 Added configuration of charge pump current and phase detector polarity
+
+v2.0 use of "long long" instead of "BigNumber", also doesn't use BitFieldManipulation and BeyondByte libraries, but internal implementations to increase execution speed. Uses Farey algorithm for fast fractional optimizer. Tested on Arduino Due.
+
+v2.1 SPI clock passed to the constructor is now actually used (previous versions always ran at the SPI library default, 4 MHz on Due). FRAC/MOD computed with an integer-only best rational approximation (continued fractions): always optimal, at most a few tens of iterations, no floating point. setrf() sets the band select clock divider (fBS = 50 kHz as required by the datasheet) and the lock detect speed according to fPFD. Output frequency is computed exactly and rounded to 1 Hz. Register 6 readback, VCO autoselect on/off with manual VCO selection, VCO lookup table calibrated with the VTUNE ADC or the lock detect pin (sweeps without VCO autoselect, no unlock at every step), optional forced fractional mode. Demo sketch with a machine readable serial protocol and a Python control panel.
 
 ## References
 
